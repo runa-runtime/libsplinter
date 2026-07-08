@@ -1,5 +1,12 @@
-# Splinter — A Cooperative Userspace Hypervisor for Inference & Other Semantic Workloads
+![Splinter Header](https://splinterhq.github.io/design/splinter-readme-hero-dark.png "Think of it like semantic breadboard.")
 
+# Splinter — A Cooperative Userspace Hypervisor that merges Inference, KV, Vectors, Graph & Governance in the same memory lane as the socket.
+
+Welcome! Splinter doesn't quite have a reference point that describes the class of tool it belongs to; it does quite a few remarkable things. To understand it, we have to _quickly_ and _briefly_ touch on why it was created. It's affectionately called "semantic breadboard" by people that build agentic AI systems with it, but its uses are far more vast.
+
+![EAGAIN is a signal](https://splinterhq.github.io/design/badges/eagain-is-a-signal.png "Feel free to use this badge if you use Splinter!") | ![Powered By Splinter](https://splinterhq.github.io/design/badges/powered-by-splinter.png "Feel free to use this badge if you use Splinter!") | ![Built With Splinter](https://splinterhq.github.io/design/badges/built-with-splinter.png "Feel free to use this badge if you use Splinter!")
+
+## Why Splinter?
 Local Large Language Model (LLM) inference is currently choking on the "Socket and Lock" tax. Standard IPC tools and databases require heavy context switching, serialization, and kernel interrupts just to synchronize state. When you are generating text or evaluating semantic alignment at token speeds, that overhead isn't just a bottleneck — it's a wall.
 
 Splinter dismantles that wall. It is a lock-free, cooperative userspace hypervisor built from the ground up for strict mechanical sympathy with modern CPU cache hierarchies (x86_64, ARM, and RISC). It puts your governance, your vector storage, and your inference engine in the exact same physical memory lane.
@@ -31,7 +38,7 @@ Every process that maps a Splinter store gets the same primitives, with no daemo
 - **Bloom labels** — a 64-bit label mask per slot for O(slots) semantic routing and batch enumeration (not a hot-path index — routing, not search).
 - **Pub/sub notifications** — 64 signal groups you can poll, plus an `eventfd`-backed event bus with a per-slot dirty mask so watchers wake only on what actually changed.
 - **Cooperative memory advisement** — a 32-slot Logic Shard bid table where processes declare `madvise` intent and elect a sovereign, so independent `posix_madvise()` calls never thrash the page cache.
-- **Self-elected univocality** — governance of shared regions via POSIX advisement primitives, with no lock and no arbiter; every process computes the same sovereign from the same static bid data.
+- **Self-elected memory advisement univocality** — governance of shared regions via POSIX advisement primitives, with no lock and no arbiter; every process computes the same sovereign from the same static bid data.
 - **Universal FFI reach** — because the store *is* the ABI, any language with a C FFI joins the same manifold as a first-class peer. Splinter ships TypeScript bindings for **Bun** and **Deno** and native **Rust** crates (in-memory and persistent), so a Node-runtime agent, a Rust service, and a C inference engine can all map the same store and see each other's writes at L3 speed. There's no client/server asymmetry — every process on the system is a universal option.
 - **A production-grade CLI/REPL** — for debugging, operations, ingestion, and inspection.
 
