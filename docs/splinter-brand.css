@@ -1,11 +1,4 @@
-/* ============================================================
-   SPLINTER — docs branding overlay  (SEQLOCK identity)
-   Drop-in, NO redesign. Load this LAST in _includes/head.njk,
-   after palette.css / general.css:
-       <link rel="stylesheet" href="/splinter-brand.css">
-   Replace /uploads/favicon.svg with the shard favicon.svg.
-   ============================================================ */
-
+/* Generated (Claude Design) — DO NOT EDIT MANUALLY. */
 /* Brand fonts (header + accents only; body type is untouched) */
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
 
