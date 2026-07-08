@@ -1,0 +1,53 @@
+/* ============================================================
+   SPLINTER — docs branding overlay  (SEQLOCK identity)
+   Drop-in, NO redesign. Load this LAST in _includes/head.njk,
+   after palette.css / general.css:
+       <link rel="stylesheet" href="/splinter-brand.css">
+   Replace /uploads/favicon.svg with the shard favicon.svg.
+   ============================================================ */
+
+/* Brand fonts (header + accents only; body type is untouched) */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+/* 1 — RE-TINT THE WHOLE PICO/LUMOCS THEME TO EMBER.
+   palette.css derives every accent from these three variables, so
+   this single change swaps the site accent from cyan (h195) to
+   Splinter ember (#CF5324 ≈ hsl 14 62% 47%) with zero layout change. */
+:root{
+  --primary-h: 14;
+  --primary-s: 62%;
+  --primary-l: 47%;
+}
+
+/* 2 — HEADER WORDMARK.
+   navbar-brand becomes the lowercase mono wordmark; the logo slot
+   carries the shard. Everything else in general.css still applies. */
+.navbar-brand{
+  font-family: 'IBM Plex Mono', ui-monospace, monospace !important;
+  font-weight: 500;
+  letter-spacing: -.04em;
+  font-size: 1.05rem !important;
+  color: var(--fg) !important;
+}
+.navbar-brand::after{                 /* the ember block cursor */
+  content: "";
+  display: inline-block;
+  width: .34em; height: 1em;
+  margin-left: .18em;
+  vertical-align: -.12em;
+  background: #CF5324;
+}
+.navbar-logo{ max-height: 1.35rem !important; max-width: 1.35rem !important; }
+
+/* 3 — SECTION HEADINGS pick up the display grotesque (still 'normal'
+   weight per general.css, so no visual heaviness is introduced). */
+article h1, article h2, article h3{
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  letter-spacing: -.015em;
+}
+
+/* 4 — Footer: retire the ⚡ emoji line's default look; ember rule on top. */
+footer{ border-top: 2px solid #CF5324 !important; }
+
+/* 5 — Inline code keeps a whisper of the brand without shouting. */
+:not(pre) > code{ color: var(--primary-highlight); }
