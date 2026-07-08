@@ -35,6 +35,8 @@ export default function (userOptions?: Options) {
         ],
       }))
       .add("splinter_thesis.pdf")
+      .add("splinter-brand.css")
+      .add("design")
       .use(favicon(options.favicon));
   };
 }
