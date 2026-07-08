@@ -1,5 +1,12 @@
-# Splinter — A Cooperative Userspace Hypervisor for Inference & Other Semantic Workloads
+![Splinter Header](https://splinterhq.github.io/design/splinter-readme-hero-dark.png "Think of it like semantic breadboard.")
 
+# Splinter — A Cooperative Userspace Hypervisor that merges Inference, KV, Vectors, Graph & Governance in the same memory lane as the socket.
+
+Welcome! Splinter doesn't quite have a reference point that describes the class of tool it belongs to; it does quite a few remarkable things. To understand it, we have to _quickly_ and _briefly_ touch on why it was created. But first, BADGES!
+
+![EAGAIN is a signal](https://splinterhq.github.io/design/badges/eagain-is-a-signal.png "Feel free to use this badge if you use Splinter!") | ![Powered By Splinter](https://splinterhq.github.io/design/badges/powered-by-splinter.png "Feel free to use this badge if you use Splinter!") | ![Built With Splinter](https://splinterhq.github.io/design/badges/built-with-splinter.png "Feel free to use this badge if you use Splinter!")
+
+## Why Splinter?
 Local Large Language Model (LLM) inference is currently choking on the "Socket and Lock" tax. Standard IPC tools and databases require heavy context switching, serialization, and kernel interrupts just to synchronize state. When you are generating text or evaluating semantic alignment at token speeds, that overhead isn't just a bottleneck — it's a wall.
 
 Splinter dismantles that wall. It is a lock-free, cooperative userspace hypervisor built from the ground up for strict mechanical sympathy with modern CPU cache hierarchies (x86_64, ARM, and RISC). It puts your governance, your vector storage, and your inference engine in the exact same physical memory lane.
