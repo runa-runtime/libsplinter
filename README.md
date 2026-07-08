@@ -38,7 +38,7 @@ Every process that maps a Splinter store gets the same primitives, with no daemo
 - **Bloom labels** — a 64-bit label mask per slot for O(slots) semantic routing and batch enumeration (not a hot-path index — routing, not search).
 - **Pub/sub notifications** — 64 signal groups you can poll, plus an `eventfd`-backed event bus with a per-slot dirty mask so watchers wake only on what actually changed.
 - **Cooperative memory advisement** — a 32-slot Logic Shard bid table where processes declare `madvise` intent and elect a sovereign, so independent `posix_madvise()` calls never thrash the page cache.
-- **Self-elected univocality** — governance of shared regions via POSIX advisement primitives, with no lock and no arbiter; every process computes the same sovereign from the same static bid data.
+- **Self-elected memory advisement univocality** — governance of shared regions via POSIX advisement primitives, with no lock and no arbiter; every process computes the same sovereign from the same static bid data.
 - **Universal FFI reach** — because the store *is* the ABI, any language with a C FFI joins the same manifold as a first-class peer. Splinter ships TypeScript bindings for **Bun** and **Deno** and native **Rust** crates (in-memory and persistent), so a Node-runtime agent, a Rust service, and a C inference engine can all map the same store and see each other's writes at L3 speed. There's no client/server asymmetry — every process on the system is a universal option.
 - **A production-grade CLI/REPL** — for debugging, operations, ingestion, and inspection.
 
