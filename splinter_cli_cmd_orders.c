@@ -32,6 +32,7 @@ int cmd_orders(int argc, char *argv[]) {
     const char *mode = argv[1];
     const char *key = argv[2];
     uint8_t count = (uint8_t)atoi(argv[3]);
+    int rc = 0;
 
     if (strcmp(mode, "set") == 0) {
         char val_buf[1024];
@@ -46,7 +47,13 @@ int cmd_orders(int argc, char *argv[]) {
 
         int ret = splinter_client_set_tandem(key, vals, lens, count);
         printf("Tandem set for %s with %d orders: %s\n", key, count, ret == 0 ? "OK" : "FAIL");
-        
+
+        /* The printed word and the exit code must never disagree: a caller that
+         * trusts $? alone would read a FAIL (no free slots, for instance) as a
+         * success and carry on writing into a tandem that was never set. */
+        if (ret != 0)
+            rc = 1;
+
         for (int i = 0; i < count; i++) {
             if (vals[i] && strlen(vals[i])) {
                 free((void *)vals[i]);
@@ -61,5 +68,5 @@ int cmd_orders(int argc, char *argv[]) {
         return 1;
     }
 
-    return 0;
+    return rc;
 }

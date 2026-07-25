@@ -42,13 +42,15 @@ void help_cmd_init(unsigned int level)
 
 int cmd_init(int argc, char *argv[])
 {
-    char save[64] = {0}, store[64] = {0};
+    char save[PATH_MAX] = {0}, store[PATH_MAX] = {0};
     int rc = 0;
     unsigned int prev_conn = 0;
     unsigned long max_slots = DEFAULT_SLOTS, max_val = DEFAULT_VAL_MAXLEN;
 
     if (thisuser.store_conn) {
-        strncpy(save, thisuser.store, 64);
+        // Always fits: thisuser.store is the same size and cli_set_store()
+        // has already length-checked whatever is in it.
+        snprintf(save, sizeof(save), "%s", thisuser.store);
         prev_conn = 1;
     }
 
@@ -64,11 +66,24 @@ int cmd_init(int argc, char *argv[])
     argparse_describe(&argparse, "\nInitialize a store", "\nCreates a new store to the specified geometry.");
     argc = argparse_parse(&argparse, argc, (const char **)argv);
 
-    if (argc != 0)
-        snprintf(store, sizeof(store) - 1, "%s", argv[argc-1]);
+    if (argc != 0) {
+        // Refuse rather than truncate. A truncated store path is usually still
+        // a creatable path, so this used to hand splinter_create() a shortened
+        // name and report success -- creating the store in the wrong place,
+        // silently, while the caller found nothing where it asked for it.
+        size_t len = strlen(argv[argc-1]);
+
+        if (len >= sizeof(store)) {
+            fprintf(stderr, "%s: store path too long (%zu bytes, max %zu)\n",
+                modname, len, sizeof(store) - 1);
+            errno = ENAMETOOLONG;
+            return 1;
+        }
+        snprintf(store, sizeof(store), "%s", argv[argc-1]);
+    }
 
     if (!store[0])
-        snprintf(store, sizeof(store) - 1, DEFAULT_BUS);
+        snprintf(store, sizeof(store), "%s", DEFAULT_BUS);
 
     size_t slot_sz = sizeof(struct splinter_slot);
     size_t arena_sz = max_slots * max_val;
@@ -103,7 +118,9 @@ restore_conn:
             thisuser.store_conn = 0;
             return rc;
         } else {
-            strncpy(thisuser.store, save, 64);
+            // Cannot fail: `save` was copied out of thisuser.store, which is
+            // the same size and already length-checked.
+            (void) cli_set_store(save);
             thisuser.store_conn = 1;
         }
     }

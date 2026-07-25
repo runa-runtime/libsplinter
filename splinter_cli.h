@@ -12,6 +12,8 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <termios.h>
+#include <limits.h>
+#include <linux/limits.h>
 
 // Hard cap on viewable history length
 #define CLI_HISTORY_MAX_LEN 1024
@@ -45,8 +47,11 @@ typedef struct {
 
 // A utility class to store user session quirks
 typedef struct cli_user {
-    // name of the store connected to
-    char store[64];
+    // name of the store connected to. Sized to hold any path the kernel will
+    // accept: this was 64 bytes, which silently truncated longer store paths
+    // into a different (often valid, and therefore silently wrong) path.
+    // Only ever written through cli_set_store().
+    char store[PATH_MAX];
     // is the user connected to a store?
     bool store_conn;
     // does the user want to abort whatever we're doing?
@@ -70,6 +75,7 @@ extern cli_user_t thisuser;
 char **cli_input_args(const char *prompt, int *argc);
 char **cli_unroll_argv(const char *input, int *out_argc);
 void cli_free_argv(char *argv[]);
+int cli_set_store(const char *path);
 int cli_find_module(const char *name);
 int cli_find_alias(int idx);
 int cli_run_module(int idx, int argc, char *argv[]);

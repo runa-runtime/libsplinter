@@ -751,8 +751,12 @@ int main (int argc, char *argv[]) {
             // --use / -u
             case 'u':
                 if (splinter_open(optarg) == 0) {
+                    if (cli_set_store(optarg) != 0) {
+                        splinter_close();
+                        fprintf(stderr, "%s: will start disconnected.\n", progname);
+                        break;
+                    }
                     thisuser.store_conn = 1;
-                    strncpy(thisuser.store, optarg, sizeof(thisuser.store) -1);
                 } else {
                     fprintf(stderr, "%s: could not connect to '%s'; will start disconnected.\n",
                     progname, optarg);
@@ -786,8 +790,12 @@ int main (int argc, char *argv[]) {
         // okay, there's one actually specified - try it.        
         if (ptmp) {
             if (splinter_open(ptmp) == 0) {
-                thisuser.store_conn = 1;
-                strncpy(thisuser.store, ptmp, sizeof(thisuser.store) -1);
+                if (cli_set_store(ptmp) != 0) {
+                    splinter_close();
+                    fprintf(stderr, "%s: will start disconnected.\n", progname);
+                } else {
+                    thisuser.store_conn = 1;
+                }
             } else {
                 fprintf(stderr, "%s: could not connect to '%s'; will start disconnected.\n",
                 progname, ptmp);
@@ -830,13 +838,17 @@ int main (int argc, char *argv[]) {
         linenoiseSetHintsCallback(hints);
         
         do {
+            // The store name is bounded explicitly here: it can now be a full
+            // PATH_MAX path, and nobody wants a 4 KB shell prompt. This is the
+            // one place truncating it is correct -- it is cosmetic, and the
+            // authoritative value is always thisuser.store itself.
             if (thisuser.lasterrno != 0) {
-                snprintf(prompt, 128, "%d : %s # ",
+                snprintf(prompt, 128, "%d : %.100s # ",
                     thisuser.lasterrno,
                     thisuser.store[0] == '\0' ? "no-conn" : thisuser.store
                 );
             } else {
-                snprintf(prompt, 128, "%s # ",
+                snprintf(prompt, 128, "%.100s # ",
                     thisuser.store[0] == '\0' ? "no-conn" : thisuser.store
                 );
             }

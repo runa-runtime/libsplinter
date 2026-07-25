@@ -29,7 +29,16 @@ int cmd_use(int argc, char *argv[]) {
     }
     splinter_close();
     if (splinter_open(argv[1]) == 0) {
-        strncpy(thisuser.store, argv[1], sizeof(thisuser.store) -1);
+        // The open succeeded on the full path, but a session that cannot
+        // record which store it is attached to must not stay attached: every
+        // later reconnect reads this field back.
+        if (cli_set_store(argv[1]) != 0) {
+            splinter_close();
+            thisuser.store[0] = '\0';
+            thisuser.store_conn = false;
+            fprintf(stderr, "%s: now disconnected.\n", modname);
+            return 1;
+        }
         thisuser.store_conn = true;
         fprintf(stderr, "%s: now connected to %s\n", modname, thisuser.store);
         return 0;

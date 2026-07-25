@@ -30,7 +30,40 @@ static const char *fmt_binary(uint64_t mask) {
 }
 
 /**
- * Returns the index of the module in the modules array given its 
+ * Record the store this session is attached to. Returns 0 on success, or 1 if
+ * the path will not fit, setting errno to ENAMETOOLONG.
+ *
+ * Every write to thisuser.store goes through here. Truncating a store path is
+ * never safe: what is left is usually still a valid path, just a different
+ * one, so a shortened path reads and writes someone else's store -- or creates
+ * a brand new one in the wrong directory -- with nothing to indicate anything
+ * went wrong. Refusing is the only correct behavior.
+ */
+int cli_set_store(const char *path) {
+    size_t len;
+
+    if (! path) {
+        errno = EINVAL;
+        return 1;
+    }
+
+    len = strlen(path);
+    if (len >= sizeof(thisuser.store)) {
+        fprintf(stderr, "splinterctl: store path too long (%zu bytes, max %zu)\n",
+            len, sizeof(thisuser.store) - 1);
+        errno = ENAMETOOLONG;
+        return 1;
+    }
+
+    // The length check above is what makes this safe and always terminated;
+    // strncpy(dst, src, sizeof(dst) - 1) would leave the final byte untouched.
+    memcpy(thisuser.store, path, len + 1);
+
+    return 0;
+}
+
+/**
+ * Returns the index of the module in the modules array given its
  * name, or -1 if not found.
  */
 int cli_find_module(const char *name) {
