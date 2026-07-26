@@ -1,6 +1,6 @@
 ![Splinter Header](https://splinterhq.github.io/design/splinter-readme-hero-dark.png "Think of it like semantic breadboard.")
 
-# Splinter — A Cooperative Userspace Hypervisor that merges Inference, KV, Vectors, Graph & Governance in the same memory lane as the socket.
+# Splinter — A Cooperative Userspace Hypervisor that provides Inference, KV, Vectors, Graph & Governance in the same memory lane as the socket.
 
 Welcome! Splinter doesn't quite have a reference point that describes the class of tool it belongs to; it does quite a few remarkable things. To understand it, we have to _quickly_ and _briefly_ touch on why it was created. It's affectionately called "semantic breadboard" by people that build agentic AI systems with it, but its uses are far more vast.
 
