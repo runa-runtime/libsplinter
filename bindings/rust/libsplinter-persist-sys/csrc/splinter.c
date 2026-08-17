@@ -55,9 +55,32 @@ static struct splinter_slot *S;
 static uint8_t *VALUES;
 /** @brief Process-local eventfd used to signal epoch changes; -1 if not initialized. */
 static int g_event_fd = -1;
+/** @brief Physical slots covered by each event bus dirty-mask bit. Never 0. */
+static size_t g_dirty_stripe = 1;
 
 /* Forward declaration — defined near splinter_pulse_watchers */
 static void splinter_event_bus_notify(size_t physical_idx);
+/* Forward declaration — routing core shared with splinter_pulse_watchers() */
+static void splinter_pulse_masks(uint64_t watcher_mask, uint64_t bloom);
+
+/**
+ * @brief Recomputes how many slots each dirty-mask bit covers.
+ *
+ * The mask is a fixed SPLINTER_EVENT_BUS_BITS wide, so a store larger than that
+ * has to share bits. Slots are divided into contiguous stripes of this width.
+ *
+ * Slot count is fixed at creation (static geometry), so this is computed once
+ * per mapping rather than on every notify — a 64-bit division is not worth
+ * paying on the write hot path, which touches the bus on every set().
+ *
+ * ceil() here is load-bearing: it guarantees SPLINTER_EVENT_BUS_BITS * stripe
+ * >= slots, so (slots-1)/stripe never exceeds the last bit of the mask.
+ */
+static void recompute_dirty_stripe(void) {
+    uint32_t n = (H && H->slots) ? H->slots : 1;
+    g_dirty_stripe = ((size_t)n + SPLINTER_EVENT_BUS_BITS - 1) / SPLINTER_EVENT_BUS_BITS;
+    if (g_dirty_stripe == 0) g_dirty_stripe = 1;
+}
 
 /**
  * @brief Computes the 64-bit FNV-1a hash of a string.
@@ -107,6 +130,7 @@ static int map_fd(int fd, size_t size) {
     H = (struct splinter_header *)g_base;
     S = (struct splinter_slot *)(H + 1);
     VALUES = (uint8_t *)(S + H->slots);
+    recompute_dirty_stripe();
     return 0;
 }
 
@@ -187,6 +211,8 @@ int splinter_create(const char *name_or_path, size_t slots, size_t max_value_sz)
      * maps a store whose header already carries the real slot count.)
      */
     VALUES = (uint8_t *)(S + H->slots);
+    /* Same reason: map_fd() computed the stripe from a slot count of 0. */
+    recompute_dirty_stripe();
     atomic_store_explicit(&H->val_brk, 0, memory_order_relaxed);
     atomic_store_explicit(&H->epoch, 1, memory_order_relaxed);
     /* New stores default to hybrid scrub (mop mode 1): see splinter_set_mop(). */
@@ -213,6 +239,17 @@ int splinter_create(const char *name_or_path, size_t slots, size_t max_value_sz)
         atomic_store_explicit(&H->shard_bids[b].claimed_at,   0, memory_order_relaxed);
     }
 
+    /*
+     * bloom_watches is a single 64-entry routing table in the header, not
+     * per-slot state. 0xFF marks a bloom bit as unwatched. This used to sit
+     * inside the slot loop below, rewriting all 64 entries once per slot —
+     * identical values every pass, and ~3.2M redundant atomic stores on a
+     * 50k-slot store.
+     */
+    for (int b = 0; b < 64; b++) {
+        atomic_store_explicit(&H->bloom_watches[b], 0xFF, memory_order_relaxed);
+    }
+
     size_t i;
     for (i = 0; i < slots; ++i) {
         atomic_fetch_or(&S[i].type_flag, SPL_SLOT_DEFAULT_TYPE);
@@ -222,12 +259,9 @@ int splinter_create(const char *name_or_path, size_t slots, size_t max_value_sz)
         atomic_store_explicit(&S[i].atime, 0, memory_order_relaxed);
         atomic_store_explicit(&S[i].user_flag, 0, memory_order_relaxed);
         atomic_store_explicit(&S[i].watcher_mask, 0, memory_order_relaxed);
-        for (int b = 0; b < 64; b++) {
-            atomic_store_explicit(&H->bloom_watches[b], 0xFF, memory_order_relaxed);
-        }
         S[i].val_off = (uint32_t)(i * max_value_sz);
         atomic_store_explicit(&S[i].val_len, 0, memory_order_relaxed);
-        S[i].key[0] = '\0';      
+        S[i].key[0] = '\0';
     }
     return 0;
 }
@@ -321,6 +355,7 @@ void splinter_close(void) {
     if (g_event_fd >= 0) { close(g_event_fd); g_event_fd = -1; }
     if (g_base) munmap(g_base, g_total_sz);
     g_base = NULL; H = NULL; S = NULL; VALUES = NULL; g_total_sz = 0;
+    g_dirty_stripe = 1;
 }
 
 int splinter_unset(const char *key) {
@@ -335,6 +370,15 @@ int splinter_unset(const char *key) {
             uint64_t start_epoch = atomic_load_explicit(&slot->epoch, memory_order_acquire);
             if (start_epoch & 1) { errno = EAGAIN; return -1; }
             int ret = (int)atomic_load_explicit(&slot->val_len, memory_order_acquire);
+            /*
+             * Capture the routing masks before the teardown below zeroes them.
+             * Destroying a slot is exactly the event a watcher most needs to
+             * hear about, but it is also the one event that erases the means of
+             * delivering it, so the pulse has to be fired from a copy taken
+             * while the slot still knows who was listening.
+             */
+            uint64_t dying_watchers = atomic_load_explicit(&slot->watcher_mask, memory_order_acquire);
+            uint64_t dying_bloom    = atomic_load_explicit(&slot->bloom, memory_order_acquire);
             atomic_store_explicit(&slot->hash, 0, memory_order_release);
             if (splinter_config_test(H, SPL_SYS_AUTO_SCRUB)) {
                 memset(VALUES + slot->val_off, 0, H->max_val_sz);
@@ -356,6 +400,10 @@ int splinter_unset(const char *key) {
             atomic_store_explicit(&slot->watcher_mask, 0, memory_order_release);
             atomic_store_explicit(&slot->bloom, 0, memory_order_release);
             atomic_fetch_add_explicit(&slot->epoch, 2, memory_order_release);
+            /* Seqlock is closed (epoch even again); safe to signal. */
+            splinter_pulse_masks(dying_watchers, dying_bloom);
+            atomic_fetch_add_explicit(&H->epoch, 1, memory_order_relaxed);
+            splinter_event_bus_notify((idx + i) % H->slots);
             return ret;
         }
     }
@@ -364,11 +412,13 @@ int splinter_unset(const char *key) {
 
 int splinter_set(const char *key, const void *val, size_t len) {
     if (!H || !key) return -2;
-    if (len == 0 || len > H->max_val_sz) return -1;
+    if (len == 0) { errno = EINVAL; return -1; }
+    if (len > H->max_val_sz) { errno = EMSGSIZE; return -1; }
 
     uint64_t h = fnv1a(key);
     size_t idx = slot_idx(h, H->slots);
     const size_t arena_sz = (size_t)H->slots * (size_t)H->max_val_sz;
+    int contended = 0;
 
     for (size_t i = 0; i < H->slots; ++i) {
         struct splinter_slot *slot = &S[(idx + i) % H->slots];
@@ -376,15 +426,19 @@ int splinter_set(const char *key, const void *val, size_t len) {
 
         if (slot_hash == 0 || (slot_hash == h && strncmp(slot->key, key, SPLINTER_KEY_MAX) == 0)) {
             uint64_t e = atomic_load_explicit(&slot->epoch, memory_order_relaxed);
-            if (e & 1ull) continue;
+            if (e & 1ull) { contended = 1; continue; }
 
             if (!atomic_compare_exchange_weak_explicit(&slot->epoch, &e, e + 1,
                                                       memory_order_acq_rel, memory_order_relaxed)) {
+                contended = 1;
                 continue;
             }
 
             if ((size_t)slot->val_off >= arena_sz || (size_t)slot->val_off + len > arena_sz) {
+                /* val_off points outside the arena: the header geometry and the
+                 * slot table disagree, which means the mapping is corrupt. */
                 atomic_fetch_add_explicit(&slot->epoch, 1, memory_order_release);
+                errno = EOVERFLOW;
                 return -1;
             }
 
@@ -425,6 +479,14 @@ int splinter_set(const char *key, const void *val, size_t len) {
             return 0;
         }
     }
+    /*
+     * Distinguish "no room" from "everyone was mid-write". The probe skips any
+     * slot whose seqlock is held, so an exhausted loop does not on its own
+     * prove the store is full — under contention a usable slot may simply have
+     * been busy every time we looked at it. ENOSPC is permanent and should stop
+     * a caller; EAGAIN is transient and should make it retry.
+     */
+    errno = contended ? EAGAIN : ENOSPC;
     return -1;
 }
 
@@ -579,6 +641,8 @@ int splinter_set_embedding(const char *key, const float *vec) {
             memcpy(slot->embedding, vec, sizeof(float) * SPLINTER_EMBED_DIM);
             atomic_thread_fence(memory_order_release);
             atomic_fetch_add_explicit(&slot->epoch, 1, memory_order_release);
+            /* Pulse after the seqlock closes, as splinter_set() does. */
+            splinter_pulse_watchers(slot);
             atomic_fetch_add_explicit(&H->epoch, 1, memory_order_relaxed);
             splinter_event_bus_notify((idx + i) % H->slots);
             return 0;
@@ -671,6 +735,8 @@ int splinter_set_named_type(const char *key, uint16_t mask) {
             }
             atomic_store_explicit(&slot->type_flag, mask, memory_order_release);
             atomic_fetch_add_explicit(&slot->epoch, 1, memory_order_release);
+            /* Pulse after the seqlock closes, as splinter_set() does. */
+            splinter_pulse_watchers(slot);
             atomic_fetch_add(&H->epoch, 1);
             splinter_event_bus_notify((idx + i) % H->slots);
             return 0;
@@ -736,6 +802,8 @@ int splinter_integer_op(const char *key, splinter_integer_op_t op, const void *m
                 case SPL_OP_DEC: *val -= m64;  break;
             }
             atomic_fetch_add_explicit(&slot->epoch, 1, memory_order_release);
+            /* Pulse after the seqlock closes, as splinter_set() does. */
+            splinter_pulse_watchers(slot);
             atomic_fetch_add_explicit(&H->epoch, 1, memory_order_relaxed);
             splinter_event_bus_notify((idx + i) % H->slots);
             return 0;
@@ -840,8 +908,19 @@ int splinter_set_label(const char *key, uint64_t mask) {
         struct splinter_slot *slot = &S[(idx + i) % H->slots];
         if (atomic_load_explicit(&slot->hash, memory_order_acquire) == h &&
             strncmp(slot->key, key, SPLINTER_KEY_MAX) == 0) {
-            atomic_fetch_or_explicit(&slot->bloom, mask, memory_order_release);
+            uint64_t after = atomic_fetch_or_explicit(&slot->bloom, mask,
+                                                      memory_order_release) | mask;
             atomic_fetch_add_explicit(&H->epoch, 1, memory_order_relaxed);
+            /*
+             * Route by the post-set bloom so a subscriber bound to the label we
+             * just applied wakes on it. Without this the documented
+             * WAITING -> SERVICING -> READY handshake never reaches anyone who
+             * subscribed with splinter_watch_label_register(): pulse_masks() is
+             * the only thing that maps bloom bits through H->bloom_watches[] to
+             * a signal group, so a missing pulse means a missing transition.
+             */
+            splinter_pulse_masks(
+                atomic_load_explicit(&slot->watcher_mask, memory_order_acquire), after);
             splinter_event_bus_notify((idx + i) % H->slots);
             return 0;
         }
@@ -857,8 +936,18 @@ int splinter_unset_label(const char *key, uint64_t mask) {
         struct splinter_slot *slot = &S[(idx + i) % H->slots];
         if (atomic_load_explicit(&slot->hash, memory_order_acquire) == h &&
             strncmp(slot->key, key, SPLINTER_KEY_MAX) == 0) {
-            atomic_fetch_and_explicit(&slot->bloom, ~mask, memory_order_release);
+            uint64_t before = atomic_fetch_and_explicit(&slot->bloom, ~mask,
+                                                        memory_order_release);
             atomic_fetch_add_explicit(&H->epoch, 1, memory_order_relaxed);
+            /*
+             * Route by the PRE-clear bloom. The whole point of clearing a label
+             * is to tell whoever was watching it that the state moved on, and
+             * that subscriber is bound to a bit the slot no longer carries — so
+             * pulsing against the current bloom would wake everyone except the
+             * one process that needed to hear it.
+             */
+            splinter_pulse_masks(
+                atomic_load_explicit(&slot->watcher_mask, memory_order_acquire), before);
             splinter_event_bus_notify((idx + i) % H->slots);
             return 0;
         }
@@ -928,23 +1017,47 @@ int splinter_pulse_keygroup(const char *key) {
 
 static void splinter_event_bus_notify(size_t physical_idx) {
     if (g_event_fd < 0 || !H) return;
-    size_t mapped = physical_idx % (SPLINTER_EVENT_BUS_MASK_WORDS * 64);
+    /*
+     * Divide, don't fold. Modulo would scatter one bit across a residue class
+     * spanning the whole store, so a watcher chasing bit k had to touch every
+     * k-th slot. Dividing gives each bit a contiguous stripe instead, which a
+     * watcher can rescan as a sequential walk. Stripe width is precomputed by
+     * recompute_dirty_stripe(); it guarantees mapped stays inside the mask.
+     */
+    size_t mapped = physical_idx / g_dirty_stripe;
     atomic_fetch_or_explicit(
         &H->event_bus.dirty_mask[mapped / 64],
         (1ULL << (mapped % 64)),
         memory_order_release);
+    /*
+     * The fd is only a doorbell; the dirty mask above is the actual state, and
+     * it is already published. So a dropped write costs nothing: EAGAIN means
+     * the counter is saturated with a wakeup nobody has drained yet, and one
+     * more increment would tell the reader nothing it isn't about to learn.
+     * The eventfd is EFD_NONBLOCK precisely so this cannot block here — we are
+     * potentially inside a seqlock write section, and stalling a writer here
+     * would stall every reader queued behind it.
+     */
     uint64_t u = 1;
     int wr = (int)write(g_event_fd, &u, sizeof(u));
     (void)wr;
 }
 
-void splinter_pulse_watchers(struct splinter_slot *slot) {
-    uint64_t mask = atomic_load_explicit(&slot->watcher_mask, memory_order_acquire);
+/*
+ * Routing core of splinter_pulse_watchers(), taking the two masks explicitly.
+ *
+ * Split out because the masks a pulse should route by are not always the ones
+ * the slot currently carries. splinter_unset_label() has to wake the subscriber
+ * bound to the label it just cleared, and splinter_unset() has to wake watchers
+ * whose bits it is in the middle of erasing. Both need to pulse against a state
+ * that no longer exists by the time the slot is consistent again.
+ */
+static void splinter_pulse_masks(uint64_t watcher_mask, uint64_t bloom) {
+    if (!H) return;
     for (int i = 0; i < SPLINTER_MAX_GROUPS; i++) {
-        if (mask & (1ULL << i))
+        if (watcher_mask & (1ULL << i))
             atomic_fetch_add_explicit(&H->signal_groups[i].counter, 1, memory_order_release);
     }
-    uint64_t bloom = slot->bloom; 
     for (int b = 0; b < 64; b++) {
         if (bloom & (1ULL << b)) {
             uint8_t g = atomic_load_explicit(&H->bloom_watches[b], memory_order_acquire);
@@ -952,6 +1065,12 @@ void splinter_pulse_watchers(struct splinter_slot *slot) {
                 atomic_fetch_add_explicit(&H->signal_groups[g].counter, 1, memory_order_release);
         }
     }
+}
+
+void splinter_pulse_watchers(struct splinter_slot *slot) {
+    splinter_pulse_masks(
+        atomic_load_explicit(&slot->watcher_mask, memory_order_acquire),
+        atomic_load_explicit(&slot->bloom, memory_order_acquire));
 }
 
 int splinter_watch_unregister(const char *key, uint8_t group_id) {
@@ -990,7 +1109,13 @@ void splinter_enumerate_matches(uint64_t mask,
 
 int splinter_event_bus_init(void) {
     if (!H) return -1;
-    int fd = eventfd(0, EFD_CLOEXEC);
+    /*
+     * EFD_NONBLOCK is not optional here. Writers pulse this fd from inside
+     * splinter_set() and friends; a blocking eventfd whose counter reached
+     * UINT64_MAX-1 with no reader draining would wedge the writer mid-write.
+     * See splinter_event_bus_notify() for why dropping the write is safe.
+     */
+    int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (fd < 0) return -1;
     atomic_store_explicit(&H->event_bus.owner_fd,  (int32_t)fd,        memory_order_release);
     atomic_store_explicit(&H->event_bus.owner_pid, (int32_t)getpid(), memory_order_release);
@@ -1040,6 +1165,24 @@ void splinter_event_bus_get_dirty(uint64_t *out, size_t words) {
     size_t n = (words < SPLINTER_EVENT_BUS_MASK_WORDS) ? words : SPLINTER_EVENT_BUS_MASK_WORDS;
     for (size_t i = 0; i < n; i++)
         out[i] = atomic_load_explicit(&H->event_bus.dirty_mask[i], memory_order_acquire);
+}
+
+void splinter_event_bus_take_dirty(uint64_t *out, size_t words) {
+    if (!H || !out) return;
+    size_t n = (words < SPLINTER_EVENT_BUS_MASK_WORDS) ? words : SPLINTER_EVENT_BUS_MASK_WORDS;
+    /*
+     * Read-and-clear per word. acq_rel because we both publish the clear to
+     * other writers and need the writes that set these bits to be visible to
+     * whatever the caller does with the snapshot. Per-word rather than
+     * whole-mask atomicity is fine: a bit set between two words is simply
+     * reported on the next take, never lost.
+     */
+    for (size_t i = 0; i < n; i++)
+        out[i] = atomic_fetch_and_explicit(&H->event_bus.dirty_mask[i], 0, memory_order_acq_rel);
+}
+
+size_t splinter_event_bus_stripe(void) {
+    return g_dirty_stripe ? g_dirty_stripe : 1;
 }
 
 int splinter_set_as_system(const char *key) {

@@ -96,6 +96,26 @@ static pid_t pid = 0;
 #define PATH_MAX 4096
 #endif
 
+/* Total bits set across a dirty-mask snapshot. */
+static int mask_popcount(const uint64_t *m, size_t words) {
+  int n = 0;
+  for (size_t i = 0; i < words; i++)
+    for (int b = 0; b < 64; b++)
+      if (m[i] & (1ULL << b)) n++;
+  return n;
+}
+
+/* Removes a store by name, mirroring how main() cleans up its own. */
+static void drop_store(const char *name) {
+  char p[PATH_MAX] = { 0 };
+#ifndef SPLINTER_PERSISTENT
+  snprintf(p, sizeof(p) - 1, "/dev/shm/%s", name);
+#else
+  snprintf(p, sizeof(p) - 1, "./%s", name);
+#endif
+  unlink(p);
+}
+
 int main(void) {
   char bus[16] = { 0 };
   char buspath[PATH_MAX] = { 0 };
@@ -317,6 +337,96 @@ splinter_get_header_snapshot(&b_after);
 
 TEST("label watch triggered pulse (global epoch check)", b_after.epoch > b_before.epoch);
 
+/* --- label transitions must reach signal-group subscribers ---
+ *
+ * The check above only proves the global epoch moved, which any write does.
+ * Delivery to a subscriber goes through splinter_pulse_watchers() routing the
+ * slot's bloom via H->bloom_watches[] into a signal group, so the counter is
+ * the only thing that actually proves the handshake works.
+ */
+const uint64_t HS_WAITING   = (1ULL << 20);
+const uint64_t HS_SERVICING = (1ULL << 21);
+const uint64_t HS_READY     = (1ULL << 22);
+const uint8_t  G_WAITING    = 20;
+const uint8_t  G_SERVICING  = 21;
+const uint8_t  G_READY      = 22;
+
+TEST("handshake: bind WAITING label to a group",
+     splinter_watch_label_register(HS_WAITING, G_WAITING) == 0);
+TEST("handshake: bind SERVICING label to a group",
+     splinter_watch_label_register(HS_SERVICING, G_SERVICING) == 0);
+TEST("handshake: bind READY label to a group",
+     splinter_watch_label_register(HS_READY, G_READY) == 0);
+
+TEST("handshake: create the request key", splinter_set("hs_key", "req", 3) == 0);
+
+/* Client sets WAITING. The sidecar bound to that label must hear it from the
+ * set_label call itself, not from some later unrelated write. */
+uint64_t hs_c = splinter_get_signal_count(G_WAITING);
+splinter_set_label("hs_key", HS_WAITING);
+TEST("handshake: set_label pulses the group bound to that label",
+     splinter_get_signal_count(G_WAITING) > hs_c);
+
+/* Sidecar clears WAITING. This is the ordering trap: routing by the post-clear
+ * bloom would wake every group except the one that was watching WAITING. */
+hs_c = splinter_get_signal_count(G_WAITING);
+splinter_unset_label("hs_key", HS_WAITING);
+TEST("handshake: unset_label pulses the group bound to the CLEARED label",
+     splinter_get_signal_count(G_WAITING) > hs_c);
+
+/* ...and on to SERVICING, then READY. */
+hs_c = splinter_get_signal_count(G_SERVICING);
+splinter_set_label("hs_key", HS_SERVICING);
+TEST("handshake: SERVICING transition reaches its subscriber",
+     splinter_get_signal_count(G_SERVICING) > hs_c);
+
+hs_c = splinter_get_signal_count(G_READY);
+splinter_unset_label("hs_key", HS_SERVICING);
+splinter_set_label("hs_key", HS_READY);
+TEST("handshake: READY transition reaches its subscriber",
+     splinter_get_signal_count(G_READY) > hs_c);
+
+/* --- the MEDIUM write paths the risk table claims pulse watchers --- */
+const uint8_t G_MED = 23;
+TEST("medium paths: create key", splinter_set("med_key", "0", 1) == 0);
+TEST("medium paths: register watcher", splinter_watch_register("med_key", G_MED) == 0);
+
+uint64_t med_c = splinter_get_signal_count(G_MED);
+splinter_set_named_type("med_key", SPL_SLOT_TYPE_BIGUINT);
+TEST("medium paths: set_named_type pulses watchers",
+     splinter_get_signal_count(G_MED) > med_c);
+
+uint64_t med_op = 1;
+med_c = splinter_get_signal_count(G_MED);
+splinter_integer_op("med_key", SPL_OP_INC, &med_op);
+TEST("medium paths: integer_op pulses watchers",
+     splinter_get_signal_count(G_MED) > med_c);
+
+#ifdef SPLINTER_EMBEDDINGS
+{
+  float med_vec[SPLINTER_EMBED_DIM];
+  for (int v = 0; v < SPLINTER_EMBED_DIM; v++) med_vec[v] = 0.5f;
+  uint64_t c = splinter_get_signal_count(G_MED);
+  splinter_set_embedding("med_key", med_vec);
+  TEST("medium paths: set_embedding pulses watchers",
+       splinter_get_signal_count(G_MED) > c);
+}
+#endif
+
+/* --- unset must signal before it erases the means of signalling ---
+ *
+ * splinter_unset() zeroes watcher_mask and bloom as part of teardown, so the
+ * pulse has to be fired from masks captured beforehand. Destroying a slot is
+ * exactly the event a watcher most needs to hear about.
+ */
+const uint8_t G_DOOMED = 24;
+TEST("unset: create doomed key", splinter_set("doomed_key", "v", 1) == 0);
+TEST("unset: register watcher", splinter_watch_register("doomed_key", G_DOOMED) == 0);
+uint64_t doomed_c = splinter_get_signal_count(G_DOOMED);
+splinter_unset("doomed_key");
+TEST("unset pulses watchers before clearing their bits",
+     splinter_get_signal_count(G_DOOMED) > doomed_c);
+
 /* --- Enumerator Tests --- */
 struct enum_tracker tracker = { 0, "" };
 const uint64_t ENUM_LABEL = (1ULL << 5);
@@ -518,6 +628,134 @@ TEST("store actually closed", splinter_get_header_snapshot(&closed) != 0);
   snprintf(buspath, sizeof(buspath) -1, "./%s", bus);
 #endif /* SPLINTER_PERSISTENT */
   unlink(buspath);
+
+  /* --- event bus: stripe geometry, take semantics, non-blocking doorbell ---
+   *
+   * These need their own stores because the geometry under test is the slot
+   * count itself, and the store above is fixed at 1000 slots.
+   */
+  {
+    char sbus[32] = { 0 };
+    uint64_t m[SPLINTER_EVENT_BUS_MASK_WORDS] = { 0 };
+
+    /* Small store: stripe collapses to 1, so the mapping is one bit per slot
+     * and behaves exactly as it did before striping existed. */
+    snprintf(sbus, sizeof(sbus), "%d-tap-stripe1", pid);
+    TEST("stripe: small store created", splinter_create_or_open(sbus, 512, 64) == 0);
+    TEST("stripe: small store maps one slot per bit", splinter_event_bus_stripe() == 1);
+    TEST("stripe: bus init on small store", splinter_event_bus_init() == 0);
+
+    splinter_set("s_one", "x", 1);
+    splinter_event_bus_take_dirty(m, SPLINTER_EVENT_BUS_MASK_WORDS);
+    TEST("stripe: one write dirties exactly one bit at stripe 1",
+         mask_popcount(m, SPLINTER_EVENT_BUS_MASK_WORDS) == 1);
+
+    /* take_dirty is read-and-clear: an immediate second take sees nothing. */
+    splinter_event_bus_take_dirty(m, SPLINTER_EVENT_BUS_MASK_WORDS);
+    TEST("take_dirty clears the mask",
+         mask_popcount(m, SPLINTER_EVENT_BUS_MASK_WORDS) == 0);
+
+    /* ...and the mask re-arms on the next write rather than staying dead. */
+    splinter_set("s_two", "y", 1);
+    splinter_event_bus_take_dirty(m, SPLINTER_EVENT_BUS_MASK_WORDS);
+    TEST("mask re-arms after a take",
+         mask_popcount(m, SPLINTER_EVENT_BUS_MASK_WORDS) == 1);
+
+    /* get_dirty must still be the non-destructive peek it always was. */
+    splinter_set("s_three", "z", 1);
+    splinter_event_bus_get_dirty(m, SPLINTER_EVENT_BUS_MASK_WORDS);
+    int peeked = mask_popcount(m, SPLINTER_EVENT_BUS_MASK_WORDS);
+    splinter_event_bus_get_dirty(m, SPLINTER_EVENT_BUS_MASK_WORDS);
+    TEST("get_dirty does not clear the mask",
+         peeked > 0 && mask_popcount(m, SPLINTER_EVENT_BUS_MASK_WORDS) == peeked);
+
+    /* The doorbell must be non-blocking, or a saturated counter with no
+     * reader draining would wedge a writer inside splinter_set(). */
+    int nbfd = splinter_event_bus_open();
+    int fl = (nbfd >= 0) ? fcntl(nbfd, F_GETFL) : -1;
+    TEST("event bus fd is non-blocking", fl != -1 && (fl & O_NONBLOCK));
+    if (nbfd >= 0) splinter_event_bus_close(nbfd);
+
+    splinter_close();
+    drop_store(sbus);
+
+    /* --- errno contract on splinter_set ---
+     *
+     * splinter.h promises ENOSPC when the store is full. It used to return a
+     * bare -1 and leave errno holding whatever an unrelated earlier call left
+     * there, so a caller following the documented contract read a stale value
+     * as a real answer. A tiny store makes "full" cheap to reach.
+     */
+    snprintf(sbus, sizeof(sbus), "%d-tap-errno", pid);
+    TEST("errno: tiny store created", splinter_create_or_open(sbus, 4, 64) == 0);
+
+    errno = 0;
+    TEST("errno: oversized value returns -1",
+         splinter_set("too_big", "x", 65) == -1);
+    TEST("errno: oversized value sets EMSGSIZE", errno == EMSGSIZE);
+
+    errno = 0;
+    TEST("errno: zero-length value returns -1",
+         splinter_set("empty", "", 0) == -1);
+    TEST("errno: zero-length value sets EINVAL", errno == EINVAL);
+
+    /* Fill all four slots, then overflow. Single-threaded, so nothing is ever
+     * mid-write and the full store cannot be mistaken for contention. */
+    int filled = 0;
+    for (int i = 0; i < 4; i++) {
+      char k[SPLINTER_KEY_MAX];
+      snprintf(k, sizeof(k), "fill_%d", i);
+      if (splinter_set(k, "v", 1) == 0) filled++;
+    }
+    TEST("errno: store filled to capacity", filled == 4);
+
+    errno = 0;
+    TEST("errno: set on a full store returns -1",
+         splinter_set("overflow_key", "v", 1) == -1);
+    TEST("errno: full store sets ENOSPC (not stale, not EAGAIN)", errno == ENOSPC);
+
+    splinter_close();
+    drop_store(sbus);
+
+    /* Large store: 5000 slots over 1024 bits -> ceil() gives 5 slots per bit. */
+    snprintf(sbus, sizeof(sbus), "%d-tap-stripeN", pid);
+    TEST("stripe: large store created", splinter_create_or_open(sbus, 5000, 64) == 0);
+    TEST("stripe: large store maps ceil(slots/bits) per bit",
+         splinter_event_bus_stripe() == 5);
+    TEST("stripe: bus init on large store", splinter_event_bus_init() == 0);
+
+    for (int i = 0; i < 2000; i++) {
+      char k[SPLINTER_KEY_MAX];
+      snprintf(k, sizeof(k), "stripe_key_%d", i);
+      splinter_set(k, "v", 1);
+    }
+    splinter_event_bus_take_dirty(m, SPLINTER_EVENT_BUS_MASK_WORDS);
+    TEST("stripe: striped writes set bits",
+         mask_popcount(m, SPLINTER_EVENT_BUS_MASK_WORDS) > 0);
+
+    /* Bit (slots-1)/stripe is the highest reachable bit. Anything above it
+     * means an index escaped the mask, which is a memory-safety bug, not just
+     * a precision one. This is the property the old modulo folding hid. */
+    size_t max_bit = (5000 - 1) / splinter_event_bus_stripe();
+    int out_of_range = 0;
+    for (size_t b = max_bit + 1; b < SPLINTER_EVENT_BUS_BITS; b++)
+      if (m[b / 64] & (1ULL << (b % 64))) out_of_range = 1;
+    TEST("stripe: no dirty bit escapes the mask", out_of_range == 0);
+
+    /* Nothing has drained the eventfd since init. Overwrite existing keys so
+     * this exercises the write path without consuming new slots. A blocking
+     * fd is what makes this shape of loop able to wedge; it must not stall. */
+    int stalled = 0;
+    for (int i = 0; i < 20000; i++) {
+      char k[SPLINTER_KEY_MAX];
+      snprintf(k, sizeof(k), "stripe_key_%d", i % 2000);
+      if (splinter_set(k, "v", 1) != 0) { stalled = 1; break; }
+    }
+    TEST("writes do not stall on an undrained eventfd", stalled == 0);
+
+    splinter_close();
+    drop_store(sbus);
+  }
 
 #ifdef HAVE_VALGRIND_H
   if (RUNNING_ON_VALGRIND) {

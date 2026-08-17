@@ -61,10 +61,19 @@ typedef enum {
     SPL_INTENT_DONTNEED   = 4
 } splinter_intent_t;
 
-/** @brief Compile-time slot cap for the event bus dirty mask (covers up to 1024 slots per word) */
-#define SPLINTER_MAX_SLOTS 1024
+/** @brief Width, in bits, of the event bus dirty mask.
+ *
+ *  This is NOT a cap on store size. A store may have any number of slots;
+ *  nothing in splinter_create() checks against this value. Slots are mapped
+ *  onto these bits in contiguous stripes — see struct splinter_event_bus. */
+#define SPLINTER_EVENT_BUS_BITS 1024
 /** @brief Number of 64-bit words in the event bus dirty mask */
-#define SPLINTER_EVENT_BUS_MASK_WORDS (SPLINTER_MAX_SLOTS / 64)
+#define SPLINTER_EVENT_BUS_MASK_WORDS (SPLINTER_EVENT_BUS_BITS / 64)
+
+/** @deprecated Misleading name: this never was a cap on slots per store, only
+ *  the width of the event bus dirty mask. Use SPLINTER_EVENT_BUS_BITS. Kept so
+ *  existing sources and generated bindings keep compiling. */
+#define SPLINTER_MAX_SLOTS SPLINTER_EVENT_BUS_BITS
 
 /** @brief Reserved store system flags */
 #define SPL_SYS_AUTO_SCRUB     (1u << 0)
@@ -137,9 +146,24 @@ struct splinter_signal_node {
  *
  * dirty_mask tracks which slot indices changed since the last read, allowing
  * watchers to enumerate only modified slots instead of scanning the full store.
- * Bits are OR'd in by writers; they are never cleared by the library.
- * For stores with more than SPLINTER_MAX_SLOTS slots, indices are mapped
- * modularly: physical_idx % (SPLINTER_EVENT_BUS_MASK_WORDS * 64).
+ *
+ * The mask is a fixed SPLINTER_EVENT_BUS_BITS wide (128 bytes) regardless of
+ * store size — it is meant to stay cache-resident. Slots are mapped onto it in
+ * contiguous stripes of ceil(slots / SPLINTER_EVENT_BUS_BITS) slots each:
+ *
+ *     bit k covers physical slots [k*stripe, min((k+1)*stripe, slots))
+ *
+ * so bit k means "at least one slot in that contiguous range changed". For a
+ * store of SPLINTER_EVENT_BUS_BITS slots or fewer the stripe is 1 and the
+ * mapping is exact, one bit per slot. Call splinter_event_bus_stripe() to get
+ * the current width rather than recomputing it. Because a stripe is contiguous,
+ * rescanning it is a sequential walk; it does not scatter across the store.
+ *
+ * Bits are OR'd in by writers. splinter_event_bus_get_dirty() only peeks and
+ * never clears, so a caller using it must diff against its own saved copy —
+ * otherwise the mask saturates to all-ones over the life of the store and stops
+ * discriminating. A single consumer should prefer splinter_event_bus_take_dirty(),
+ * which snapshots and clears in one atomic step.
  */
 struct splinter_event_bus {
     atomic_uint_least64_t dirty_mask[SPLINTER_EVENT_BUS_MASK_WORDS];
@@ -408,15 +432,27 @@ typedef enum {
  * Other errno values you will meet are NOT contention and must not be retried
  * verbatim: EMSGSIZE (a value or append exceeds max_val_sz — a geometry
  * problem), ENOSPC (the store is full, or the 32-slot shard bid table is full),
- * and ETIMEDOUT (a bounded cooperative-madvise wait expired). Only EAGAIN
- * means "the same call will succeed once the writer leaves."
+ * EOVERFLOW (a slot's value offset falls outside the arena — the mapping is
+ * corrupt, stop), EINVAL (a zero-length value), and ETIMEDOUT (a bounded
+ * cooperative-madvise wait expired). Only EAGAIN means "the same call will
+ * succeed once the writer leaves."
+ *
+ * Note that splinter_set() distinguishes a genuinely full store from transient
+ * contention. Its probe skips slots whose seqlock is held, so exhausting the
+ * probe does not by itself prove there is no room: if any candidate was busy
+ * you get EAGAIN (retry), and only if none were do you get ENOSPC (give up).
  *
  * RISK TOPOLOGY — KNOW BEFORE YOU CALL
  * --------------------------------------
  * DESTRUCTIVE (epoch reset/rewind, data or vectors zeroed, watchers pulsed):
  *   splinter_unset()         — frees the slot, zeroes key+value, clears labels
  *   splinter_retrain_slot()  — scrubs the embedding, drives the epoch *backward*
- *   splinter_purge()         — sweeps stale bytes past val_len across every slot
+ *   splinter_purge()         — sweeps stale bytes past val_len across every slot.
+ *                              Does NOT pulse watchers and does not advance any
+ *                              epoch: it touches every slot in the store, so
+ *                              signalling per slot would be a wake storm, and
+ *                              it only scrubs bytes already past val_len — no
+ *                              live value changes. Nothing to tell a watcher.
  *
  * HIGH (permanent label state change, signal propagation, real syscalls):
  *   splinter_set_label(), splinter_unset_label(),
@@ -427,7 +463,14 @@ typedef enum {
  * MEDIUM (value overwrite, epoch advance, watchers pulsed):
  *   splinter_set(), splinter_append(), splinter_set_embedding(),
  *   splinter_integer_op(), splinter_set_named_type(),
- *   splinter_set_slot_time(), splinter_client_set_tandem()
+ *   splinter_client_set_tandem(),
+ *   splinter_event_bus_take_dirty() — clears shared notification state, so a
+ *                                     second watcher can miss the bits you took
+ *
+ * LOW-WRITE (metadata only — no value change, no epoch advance, no pulse):
+ *   splinter_set_slot_time() — overwrites a slot's ctime/atime and nothing
+ *                              else. Watchers are not signalled: a timestamp
+ *                              is not a state transition anyone waits on.
  *
  * CONFIG (mutate store or shard policy, not slot data — own them deliberately):
  *   splinter_set_mop(), splinter_event_bus_init(),
@@ -442,7 +485,7 @@ typedef enum {
  *   splinter_shard_election(), splinter_shard_is_sovereign(),
  *   splinter_shard_table_snapshot(),
  *   splinter_event_bus_open(), splinter_event_bus_wait(),
- *   splinter_event_bus_get_dirty()
+ *   splinter_event_bus_get_dirty(), splinter_event_bus_stripe()
  *
  * If your confidence in the correctness of your inputs is below ~0.90,
  * do not call DESTRUCTIVE or HIGH risk functions. Retrieve a slot
@@ -1058,7 +1101,14 @@ int splinter_event_bus_open(void);
  *
  * Uses poll(2) + read(2) on the fd returned by splinter_event_bus_open().
  * On return, the eventfd counter has been drained; the caller should call
- * splinter_event_bus_get_dirty() to find which slots changed.
+ * splinter_event_bus_get_dirty() or splinter_event_bus_take_dirty() to find
+ * which slot stripes changed.
+ *
+ * The underlying eventfd is non-blocking, and O_NONBLOCK lives on the open file
+ * description shared by every fd handed out for this bus. So if two waiters
+ * poll concurrently and one drains the counter first, the other's read fails
+ * with EAGAIN and this returns -1 rather than blocking indefinitely. Treat a -1
+ * as "nothing for me right now" and re-arm; it is not necessarily an error.
  *
  * @param fd       The fd returned by splinter_event_bus_open().
  * @param timeout_ms Maximum wait time in milliseconds; 0 = non-blocking,
@@ -1076,15 +1126,48 @@ void splinter_event_bus_close(int fd);
 /**
  * @brief Copy a snapshot of the dirty-slot bitmask into caller-supplied storage.
  *
- * Each bit i in word w represents physical slot index (w*64 + i).  A set bit
- * means that slot was written since the bus was initialized.  Bits are never
- * cleared by the library; use the snapshot delta against your own saved copy
- * to find newly-dirtied slots.
+ * Bit i of word w covers physical slots [b*stripe, (b+1)*stripe) where
+ * b = w*64 + i and stripe = splinter_event_bus_stripe().  A set bit means at
+ * least one slot in that contiguous range was written since the bus was
+ * initialized.  For stores of SPLINTER_EVENT_BUS_BITS slots or fewer the stripe
+ * is 1 and bit b is exactly slot b.
+ *
+ * This call does NOT clear the mask, so diff the snapshot against your own
+ * saved copy to find newly-dirtied stripes.  If you do not diff, the mask
+ * saturates to all-ones over the life of the store.  A single consumer that has
+ * no need to share the mask should use splinter_event_bus_take_dirty() instead.
  *
  * @param out   Destination array; must hold at least `words` uint64_t values.
  * @param words Number of words to copy (cap: SPLINTER_EVENT_BUS_MASK_WORDS).
  */
 void splinter_event_bus_get_dirty(uint64_t *out, size_t words);
+
+/**
+ * @brief Snapshot the dirty-slot bitmask and clear it in one atomic step.
+ *
+ * Same bit geometry as splinter_event_bus_get_dirty(), but each word is read
+ * and zeroed atomically, so every set bit is reported exactly once and the mask
+ * cannot saturate.  This is the right call for a single consumer.
+ *
+ * Destructive to other watchers: bits taken here are gone for everyone.  With
+ * two or more independent readers of the same store, use
+ * splinter_event_bus_get_dirty() and have each reader diff its own copy.
+ *
+ * @param out   Destination array; must hold at least `words` uint64_t values.
+ * @param words Number of words to take (cap: SPLINTER_EVENT_BUS_MASK_WORDS).
+ */
+void splinter_event_bus_take_dirty(uint64_t *out, size_t words);
+
+/**
+ * @brief Number of physical slots covered by each dirty-mask bit.
+ *
+ * Returns ceil(slots / SPLINTER_EVENT_BUS_BITS) for the currently mapped store,
+ * or 1 if no store is mapped.  Bit b of the mask covers physical slots
+ * [b*stripe, min((b+1)*stripe, slots)).  A return of 1 means the mask is exact.
+ *
+ * @return Slots per dirty-mask bit; never 0.
+ */
+size_t splinter_event_bus_stripe(void);
 
 /**
  * @brief Promotes a key to "system" usage
