@@ -9,7 +9,7 @@ members = [
 # Metadata shared by every published -sys crate in this workspace.
 # Individual crates inherit these with `field.workspace = true`.
 [workspace.package]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Tim Post <timthepost@protonmail.com>"]
